@@ -61,6 +61,10 @@ bool TargetData::setValues(int16_t _x, int16_t _y, int16_t _speed, uint16_t _dis
   distance = sqrt(sq(x) + sq(y));
   angle = atan2((float)y, (float)x) * 180.0 / PI;
 
+// #ifdef RD03D_LOGGER_DEBUG
+//   printInfo();
+// #endif
+
   // If distance is more than theoretical, measurement not valid
   if( distance > MAX_DISTANCE){
     clearValues();
@@ -191,6 +195,11 @@ bool RD03D::tasks() {
 
 bool RD03D::processFrame() {
 
+  int16_t tx;
+  int16_t ty;
+  int16_t tspeed;
+  uint16_t tdistRes;
+
   // Example assumes a frame structure with a header (first 4 bytes) then target data.
   // Ensure the frame is long enough (adjust the minimum length as necessary).
   if (_bufferRxIndex < 12) return false;
@@ -203,10 +212,39 @@ bool RD03D::processFrame() {
   // Here we start from index 4 and step through the buffer.
   for (size_t i = 4; i + 7 < _bufferRxIndex - 2; i += 8) {
 
-    int16_t tx = (int16_t)(_bufferRx[i] | (_bufferRx[i + 1] << 8)) - 0x200;
-    int16_t ty = (int16_t)(_bufferRx[i + 2] | (_bufferRx[i + 3] << 8)) - 0x8000;
-    int16_t tspeed = (int16_t)(_bufferRx[i + 4] | (_bufferRx[i + 5] << 8)) - 0x10;
-    uint16_t tdistRes = (uint16_t)(_bufferRx[i + 6] | (_bufferRx[i + 7] << 8));
+    // X in mm
+    if(_bufferRx[i + 1] & 0x80)
+      tx = (int16_t)(_bufferRx[i] | (_bufferRx[i + 1] << 8)) - 32768;
+    else
+      tx = 0 - (int16_t)(_bufferRx[i] | (_bufferRx[i + 1] << 8));
+
+    // Y in mm
+    if(_bufferRx[i + 3] & 0x80)
+      ty = (int16_t)(_bufferRx[i+2] | (_bufferRx[i + 3] << 8)) - 32768;
+    else
+      ty = 0 - (int16_t)(_bufferRx[i+2] | (_bufferRx[i + 3] << 8));
+
+    // SPEED in cm/s
+    if(_bufferRx[i + 5] & 0x80)
+      tspeed = (int16_t)(_bufferRx[i+4] | (_bufferRx[i + 5] << 8)) - 32768;
+    else
+      tspeed = 0 - (int16_t)(_bufferRx[i+4] | (_bufferRx[i + 5] << 8));
+
+    // DISTANCE in mm
+    tdistRes = (uint16_t)(_bufferRx[i + 6] | (_bufferRx[i + 7] << 8));
+
+// #ifdef RD03D_LOGGER_DEBUG
+//     Serial.printf("#    Target data -  %d - x: ", _targetPtr);
+//     Serial.print(tx );
+//     Serial.print(" mm, y: ");
+//     Serial.print(ty);
+//     Serial.print(" mm, speed: ");
+//     Serial.print(tspeed);
+//     Serial.print(" cm/x, res: ");
+//     Serial.print(tdistRes);
+//     Serial.print(" mm");
+//     Serial.println("");
+// #endif
 
     if(_targets[_targetPtr++].setValues(tx, ty, tspeed, tdistRes))
       _targetCount++;
