@@ -102,9 +102,9 @@ void TargetData::printInfo(){
   Serial.print(" cm, ");
   Serial.print(angle);
   Serial.print("°, (");
-  Serial.print(x / 10);
+  Serial.print(x / 10.0);
   Serial.print(",");
-  Serial.print(y / 10);
+  Serial.print(y / 10.0);
   Serial.print("), ");
   Serial.print(speed);
   Serial.println(" cm/s");
@@ -115,9 +115,14 @@ void TargetData::printInfo(){
 //
 // --- RD03D Class Implementation ---
 //
+
+// Data frame markers observed from the module (the datasheet does not document the protocol).
+const uint8_t RD03D::FRAME_HEADER[4] = {0xAA, 0xFF, 0x03, 0x00};
+
 RD03D::RD03D(uint8_t rxPin, uint8_t txPin, uint32_t baudRate, HardwareSerial* serial, size_t bufferSize)
   : _rxPin(rxPin), _txPin(txPin), _baudRate(baudRate), _bufferSize(bufferSize), _mode(SINGLE_TARGET),
-    _serial(serial), _bufferRxIndex(0), _bufferTxIndex(0), _targetCount(0)
+    _serial(serial), _bufferRxIndex(0), _bufferTxIndex(0), _targetCount(0),
+    _rxState(RX_HEADER), _headerMatch(0)
 {
   // Allocate the buffer for incoming data.
   _bufferRx = new uint8_t[_bufferSize];
@@ -131,37 +136,36 @@ RD03D::RD03D(uint8_t rxPin, uint8_t txPin, uint32_t baudRate, HardwareSerial* se
 
 bool RD03D::initialize( RD03DMode mode ) {
 
-  uint8_t res;
-
-  // Begin serial communication on the given port with the specified baud rate.
+  // A larger RX buffer keeps the UART from overflowing at 256000 baud between
+  // calls to tasks(). It MUST be configured before begin().
+  _serial->setRxBufferSize(512);
   _serial->begin(_baudRate, SERIAL_8N1, _rxPin, _txPin);
-  delay(10); // Allow time for the serial port and module to initialize
+
+  delay(1000); // The module needs time to boot before it accepts commands.
 
   // Set mode
   _mode = mode;
 
-  // Send configuration commands to the radar module.
+  // Send the detection-mode command to the radar module.
   cmd_buffer_rx_clean();
-  if (_mode == SINGLE_TARGET) {
+  if (_mode == SINGLE_TARGET)
     cmd_send_buffer(CMD_TARGET_DETECTION_SINGLE, sizeof(CMD_TARGET_DETECTION_SINGLE));
-  }else if (_mode == MULTI_TARGET) {
+  else
     cmd_send_buffer(CMD_TARGET_DETECTION_MULTI, sizeof(CMD_TARGET_DETECTION_MULTI));
-  }else{
-    return false;
-  }
 
-  // Wait for a response
-  res = cmd_receive_ack();
-
-  // TODO we will need to check the response, but since there is no clear documentation, we assume correct command.
-
-  // Clear rx buffer
+  // The module does not reliably acknowledge this command, so a missing ACK is
+  // NOT treated as a failure (the reference implementation doesn't check one
+  // either). We just give it time to apply and flush whatever it sends back.
+  cmd_receive_ack();
+  delay(200);
   cmd_buffer_rx_clean();
 
-  if(res > 0)
-    return true;
-  else
-    return false;
+  // Start the parser hunting for a frame header.
+  _rxState       = RX_HEADER;
+  _headerMatch   = 0;
+  _bufferRxIndex = 0;
+
+  return true;
 }
 
 bool RD03D::tasks() {
@@ -172,25 +176,59 @@ bool RD03D::tasks() {
   while (_serial->available()) {
 
     uint8_t incomingByte = _serial->read();
-    _bufferRx[_bufferRxIndex++] = incomingByte;
 
-    // Prevent buffer overflow.
-    if (_bufferRxIndex >= _bufferSize) {
-      _bufferRxIndex = _bufferSize - 1;
-    }
+    switch (_rxState) {
 
-    // Check if the last two bytes match the frame terminator (0x55, 0xCC).
-    if (_bufferRxIndex > 1 && _bufferRx[_bufferRxIndex - 2] == 0x55 && _bufferRx[_bufferRxIndex - 1] == 0xCC) {
-      res = processFrame();
+      // Hunt for the 4-byte header (0xAA 0xFF 0x03 0x00) so a frame can never
+      // start mid-stream. This is the key fix: the old parser only looked for
+      // the footer, so a stray 0x55 0xCC in the payload (or a dropped byte)
+      // permanently misaligned every subsequent frame.
+      case RX_HEADER:
+        if (incomingByte == FRAME_HEADER[_headerMatch]) {
+          _bufferRx[_headerMatch++] = incomingByte;
+          if (_headerMatch == sizeof(FRAME_HEADER)) {
+            _bufferRxIndex = _headerMatch;   // payload starts right after the header
+            _rxState = RX_PAYLOAD;
+          }
+        } else {
+          // Restart the match, allowing this byte to be a fresh header start.
+          _headerMatch = (incomingByte == FRAME_HEADER[0]) ? 1 : 0;
+          if (_headerMatch) _bufferRx[0] = incomingByte;
+        }
+        break;
+
+      // Collect payload until the footer (0x55 0xCC). After every frame we go
+      // back to hunting the header, so a corrupt/truncated frame self-heals on
+      // the next real header instead of poisoning the stream forever.
+      case RX_PAYLOAD:
+        _bufferRx[_bufferRxIndex++] = incomingByte;
+
+        if (_bufferRxIndex >= 6 &&
+            _bufferRx[_bufferRxIndex - 2] == 0x55 &&
+            _bufferRx[_bufferRxIndex - 1] == 0xCC) {
+          if (processFrame()) res = true;
 #ifdef RD03D_LOGGER_DEBUG
-      Serial.print("# RX FRAME: ");
-      printHex(_bufferRx, _bufferRxIndex);      
+          Serial.print("# RX FRAME: ");
+          printHex(_bufferRx, _bufferRxIndex);
 #endif
-      _bufferRxIndex = 0; // Reset the buffer after processing.
+          _headerMatch   = 0;
+          _bufferRxIndex = 0;
+          _rxState       = RX_HEADER;
+        }
+        // Guard against a runaway frame (lost footer / corruption): resync.
+        else if (_bufferRxIndex >= _bufferSize) {
+#ifdef RD03D_LOGGER_DEBUG
+          Serial.println("# RX FRAME - OVERFLOW, resync");
+#endif
+          _headerMatch   = 0;
+          _bufferRxIndex = 0;
+          _rxState       = RX_HEADER;
+        }
+        break;
     }
   }
 
-  return res; 
+  return res;
 }
 
 bool RD03D::processFrame() {
@@ -200,19 +238,30 @@ bool RD03D::processFrame() {
   int16_t tspeed;
   uint16_t tdistRes;
 
-  // Example assumes a frame structure with a header (first 4 bytes) then target data.
-  // Ensure the frame is long enough (adjust the minimum length as necessary).
-  if (_bufferRxIndex < 12) return false;
-  
-  // Save the target data based on the operating mode.
-  uint8_t _targetPtr = 0;
+  // Frame layout: [4-byte header][N * 8 target bytes][2-byte footer].
+  // Validate the geometry before trusting it: the payload must be a whole
+  // number of 8-byte targets. This rejects frames truncated by a stray footer
+  // so we never parse misaligned garbage.
+  if (_bufferRxIndex < 4 + 8 + 2) return false;        // need at least one target
+  size_t payloadLen = _bufferRxIndex - 4 - 2;          // strip header and footer
+  if (payloadLen % 8 != 0) return false;               // corrupt / truncated frame
+  size_t nTargets = payloadLen / 8;
+  if (nTargets > MAX_TARGETS) nTargets = MAX_TARGETS;
+
+  // Clear EVERY slot first. The old code only touched slots the loop reached,
+  // so a short frame left stale data in higher slots that still reported
+  // isValid() == true — phantom targets. Clearing up front prevents that.
+  for (uint8_t t = 0; t < MAX_TARGETS; t++)
+    _targets[t].clearValues();
+
   _targetCount = 0;
 
-  // For multi-target, assume each target occupies 8 bytes and parse them sequentially.
-  // Here we start from index 4 and step through the buffer.
-  for (size_t i = 4; i + 7 < _bufferRxIndex - 2; i += 8) {
+  // Each target occupies 8 bytes starting at index 4.
+  for (uint8_t t = 0; t < nTargets; t++) {
 
-    // X in mm
+    size_t i = 4 + (size_t)t * 8;
+
+    // X in mm (sign-magnitude: bit15 set = positive, magnitude in bits 14:0)
     if(_bufferRx[i + 1] & 0x80)
       tx = (int16_t)(_bufferRx[i] | (_bufferRx[i + 1] << 8)) - 32768;
     else
@@ -230,27 +279,11 @@ bool RD03D::processFrame() {
     else
       tspeed = 0 - (int16_t)(_bufferRx[i+4] | (_bufferRx[i + 5] << 8));
 
-    // DISTANCE in mm
+    // DISTANCE resolution in mm (little-endian)
     tdistRes = (uint16_t)(_bufferRx[i + 6] | (_bufferRx[i + 7] << 8));
 
-// #ifdef RD03D_LOGGER_DEBUG
-//     Serial.printf("#    Target data -  %d - x: ", _targetPtr);
-//     Serial.print(tx );
-//     Serial.print(" mm, y: ");
-//     Serial.print(ty);
-//     Serial.print(" mm, speed: ");
-//     Serial.print(tspeed);
-//     Serial.print(" cm/x, res: ");
-//     Serial.print(tdistRes);
-//     Serial.print(" mm");
-//     Serial.println("");
-// #endif
-
-    if(_targets[_targetPtr++].setValues(tx, ty, tspeed, tdistRes))
+    if(_targets[t].setValues(tx, ty, tspeed, tdistRes))
       _targetCount++;
-
-    // Limit the number of targets to the allocated size.
-    if (_targetPtr >= MAX_TARGETS) break;
   }
 
   return _targetCount > 0;
@@ -262,6 +295,11 @@ TargetData* RD03D::getTarget(uint8_t target_num) {
     target_num = MAX_TARGETS -1;
 
   return &_targets[target_num];
+}
+
+// Return a pointer to the internal targets array (for multi-target iteration).
+TargetData* RD03D::getTargets() {
+  return _targets;
 }
 
 
