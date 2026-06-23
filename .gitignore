@@ -2,3 +2,4 @@
 .vscode
 src/main.cpp
 src/dev_main.cpp
+.DS_Store
