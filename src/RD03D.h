@@ -105,6 +105,15 @@ class RD03D {
     const uint8_t CMD_TARGET_DETECTION_SINGLE[12] = {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0x80, 0x00, 0x04, 0x03, 0x02, 0x01};
     const uint8_t CMD_TARGET_DETECTION_MULTI[12]  = {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0x90, 0x00, 0x04, 0x03, 0x02, 0x01};   
 
+    // Data frame framing (NOT documented in the datasheet — observed from the
+    // module output): [4-byte header 0xAA 0xFF 0x03 0x00][N * 8 target bytes][footer 0x55 0xCC]
+    static const uint8_t FRAME_HEADER[4];
+
+    // Incremental parser: hunt for the header, then collect payload until the footer.
+    enum RxState { RX_HEADER, RX_PAYLOAD };
+    RxState _rxState;
+    size_t  _headerMatch;   // header bytes matched so far while in RX_HEADER
+
     // Module serial comms
     uint8_t   _rxPin;
     uint8_t   _txPin;
